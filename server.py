@@ -15,7 +15,12 @@
   GET /api/parse?url=<分享链接或整段文案>   → 元数据 + 直链 + 代理下载地址
   GET /api/video?url=<链接>&name=x.mp4      → 直接流式返回视频文件（一步到位）
   GET /api/download?u=<直链>&name=x.mp4     → 通用直链代理（Range 续传）
-  GET /health
+  GET /health                              （免鉴权）
+
+鉴权（2026-10-21 起）: 除 /health 外均需 API Key —
+  请求头 X-API-Key: <key>，或 Authorization: Bearer <key>，或查询参数 ?key=<key>
+  key 配置在同目录 .env（API_KEY=...，chmod 600）或环境变量 API_KEYS。
+  返回的 download_url 自带 exp+sig 签名，可直接打开，不需要再带 key。详见 auth.py。
 
 运行: python3 server.py --port 8765
 """
@@ -32,6 +37,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import auth
 import kuaishou
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -424,8 +430,37 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "X-API-Key, Authorization, Content-Type, Range")
         self.end_headers()
         self.wfile.write(payload)
+
+    def do_OPTIONS(self):
+        """CORS 预检（浏览器带 X-API-Key 头时会先发 OPTIONS）"""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "X-API-Key, Authorization, Content-Type, Range")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _authorize(self, path, params):
+        """API Key 校验。/api/media 与 /api/download 也接受本服务签发的 exp+sig 签名链接。
+        通过返回 True；否则已写出 401/429 并返回 False。"""
+        if not auth.ENABLED:
+            return True
+        if path in ("/api/media", "/api/download") and params.get("sig") and auth.check_sig(path, params):
+            return True
+        key = auth.extract_key(self.headers, params)
+        ok, code = auth.check_key(key)
+        if not ok:
+            msg = "请提供 API Key（请求头 X-API-Key 或 ?key=）" if code == "API_KEY_REQUIRED" else "API Key 无效"
+            self._json(401, {"ok": False, "error": msg, "error_code": code})
+            return False
+        if not auth.rate_ok(key):
+            self._json(429, {"ok": False, "error": "请求过于频繁", "error_code": "RATE_LIMITED"})
+            return False
+        return True
 
     def do_POST(self):
         """支持 POST 提交长分享文案（curl --data-urlencode 默认走 POST）"""
@@ -453,6 +488,8 @@ class Handler(BaseHTTPRequestHandler):
         # URL 查询串参数优先
         for k, v in urllib.parse.parse_qs(parsed.query).items():
             fields[k] = v[0]
+        if not self._authorize(parsed.path, fields):
+            return
         self._handle_parse(fields, is_video=(parsed.path == "/api/video"))
 
     def _raw_path(self):
@@ -475,8 +512,12 @@ class Handler(BaseHTTPRequestHandler):
                 "device": omni_device(),
                 "quota_exhausted": omni_quota_blocked(),
                 "quota_reset_at": int(omni_quota_reset_at()) or None,
+                "auth": auth.ENABLED,
                 "ts": int(time.time()),
             })
+            return
+
+        if parsed.path.startswith("/api/") and not self._authorize(parsed.path, flat):
             return
 
         if parsed.path in ("/api/parse", "/api/video"):
@@ -543,7 +584,7 @@ class Handler(BaseHTTPRequestHandler):
             for im in note["images_meta"]:
                 fn = f"dy_{aweme_id}_{im['index'] + 1}.{im['ext']}"
                 out["images"].append({**im, "filename": fn,
-                    "download_url": base + f"/api/media?{urllib.parse.urlencode({'via': 'dyxhs_img', 'url': url, 'index': im['index'], 'name': fn})}"})
+                    "download_url": base + auth.sign("/api/media", {'via': 'dyxhs_img', 'url': url, 'index': im['index'], 'name': fn})})
             out["cover"] = out["images"][0]["download_url"]
             out["download_url"] = out["cover"]
             out["direct_url"] = None
@@ -562,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
             safe_title = re.sub(r"[\\/:*?\"<>|\s]+", "_", result["title"])[:60] or f"dy_{int(time.time())}"
             fname = name or f"{safe_title}.{first.get('ext','mp4')}"
             result["filename"] = fname
-            result["download_url"] = base + f"/api/media?{urllib.parse.urlencode({'via': 'omni', 'url': url, 'fmt': result['formats'].index(first), 'name': fname})}"
+            result["download_url"] = base + auth.sign("/api/media", {'via': 'omni', 'url': url, 'fmt': result['formats'].index(first), 'name': fname})
             # 原始直链（有时效，约几十分钟）
             result["direct_url"] = first.get("direct_url")
         else:
@@ -572,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             fb["aweme_id"] = aweme_id
             fb["filename"] = name or (f"dy_{aweme_id}.mp4" if aweme_id else f"dy_{int(time.time())}.mp4")
-            fb["download_url"] = base + f"/api/media?{urllib.parse.urlencode({'via': 'dyxhs', 'url': url, 'name': fb['filename']})}"
+            fb["download_url"] = base + auth.sign("/api/media", {'via': 'dyxhs', 'url': url, 'name': fb['filename']})
             fb["direct_url"] = None
             result = fb
 
@@ -600,7 +641,7 @@ class Handler(BaseHTTPRequestHandler):
             fname = name or f"{stem}.mp4"
             out["filename"] = fname
             out["direct_url"] = r["videos"][0]
-            out["download_url"] = base + "/api/download?" + urllib.parse.urlencode({"u": r["videos"][0], "name": fname})
+            out["download_url"] = base + auth.sign("/api/download", {"u": r["videos"][0], "name": fname})
             out["formats"] = [{"ext": "mp4", "width": r.get("width"), "height": r.get("height"), "direct_url": u} for u in r["videos"][:1]]
         else:
             imgs = []
@@ -608,11 +649,16 @@ class Handler(BaseHTTPRequestHandler):
                 ext = "webp" if ".webp" in u else ("png" if ".png" in u else "jpg")
                 fn = f"{stem}_{i + 1}.{ext}"
                 imgs.append({"index": i, "filename": fn, "direct_url": u,
-                             "download_url": base + "/api/download?" + urllib.parse.urlencode({"u": u, "name": fn})})
+                             "download_url": base + auth.sign("/api/download", {"u": u, "name": fn})})
             out["images"] = imgs
             out["filename"] = imgs[0]["filename"]
             out["download_url"] = imgs[0]["download_url"]
             out["direct_url"] = None
+            out["image_count"] = len(imgs)
+            if r.get("music"):
+                mfn = f"{stem}_music.m4a"
+                out["music"] = {"filename": mfn, "direct_url": r["music"],
+                                "download_url": base + auth.sign("/api/download", {"u": r["music"], "name": mfn})}
             is_video = False  # 图集没有单个视频可 302，返回 JSON
         out["ok"] = True
         if is_video:
@@ -738,6 +784,7 @@ def main():
     print(f"  解析:     GET /api/parse?url=<分享链接或文案>")
     print(f"  直接下载: GET /api/video?url=<链接>  (302 → 视频流)")
     print(f"  引擎: OmniParser（元数据+直链）→ dyxhsdownloader 兜底")
+    print(f"  鉴权: {'已启用（' + str(len(auth.KEYS)) + ' 个 key，QPS 上限 ' + (str(auth.QPS_LIMIT) if auth.QPS_LIMIT else '不限') + '）' if auth.ENABLED else '未配置 API_KEY，鉴权关闭！'}")
     print(f"  设备指纹: {omni_device()[:8]}… (被封自动轮换，节流 {OMNI_MIN_INTERVAL}s/次)")
     srv.serve_forever()
 

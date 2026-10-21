@@ -1,5 +1,11 @@
 """快手解析：分享链接/文案 → photoId → 移动分享页 window.INIT_STATE → 无水印 mp4 或图集。
-无需登录 / Cookie。直链来自 photo.mainMvUrls（kwimgs CDN，裸连可下，支持 Range）。"""
+无需登录 / Cookie。直链来自 photo.mainMvUrls（kwimgs CDN，裸连可下，支持 Range）。
+
+图集（atlas，photoType = VERTICAL_ATLAS / HORIZONTAL_ATLAS）解析思路移植自
+ucmao/media-parser（MIT License, https://github.com/ucmao/media-parser）
+src/parsers/kuaishou_parser.py：atlas 可能挂在 photo.ext_params.atlas 或与 photo 同级，
+两处都收集，优先 .webp 版本；CDN 取 atlas.cdn（字符串或列表）或 atlas.cdnList[].cdn；
+路径若已是完整 URL 则原样使用；配乐 = musicCdnList[0].cdn + music。"""
 import json
 import re
 import time
@@ -12,7 +18,7 @@ MUA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1
 
 KS_PATTERNS = [
     re.compile(r"https?://v\.kuaishou\.com/[A-Za-z0-9_\-]+/?"),
-    re.compile(r"https?://(?:www\.)?kuaishou\.com/(?:f|short-video|fw/photo|photo)/[A-Za-z0-9_\-]+[^\s\"'，。]*"),
+    re.compile(r"https?://(?:[a-z0-9\-]+\.)?kuaishou\.com/(?:f|short-video|fw/photo|fw/long-video|photo)/[A-Za-z0-9_\-]+[^\s\"'，。]*"),
     re.compile(r"https?://(?:[a-z0-9\-]+\.)*(?:chenzhongtech|gifshow|kuaishouapp)\.com/[^\s\"'，。]+"),
 ]
 PAGE_HOSTS = ["https://v.m.chenzhongtech.com/fw/photo/", "https://m.gifshow.com/fw/photo/"]
@@ -92,11 +98,58 @@ def _state(pid):
             d = json.loads(m.group(1))
             for v in d.values():
                 if isinstance(v, dict) and isinstance(v.get("photo"), dict):
-                    return v["photo"]
+                    return v   # 整个 payload：photo 及与之同级的 atlas
             last = "INIT_STATE 中无作品数据（可能已删除/私密/需登录）"
         except Exception as ex:
             last = str(ex)
     raise RuntimeError(last or "解析失败")
+
+
+def _norm(u):
+    if not u:
+        return None
+    u = str(u).replace("\\u002F", "/")
+    return "https:" + u if u.startswith("//") else u
+
+
+def _cdns(atlas):
+    """atlas.cdn 可能是字符串或列表；退回 atlas.cdnList[].cdn"""
+    c = atlas.get("cdn") or []
+    if isinstance(c, str):
+        c = [c]
+    if not c:
+        c = [i.get("cdn") for i in atlas.get("cdnList") or [] if isinstance(i, dict) and i.get("cdn")]
+    return [x for x in c if isinstance(x, str) and x] or ["p2.a.yximgs.com"]
+
+
+def _join(cdn, path):
+    path = _norm(path)
+    if not path:
+        return None
+    if path.startswith(("http://", "https://")):
+        return path
+    cdn = _norm(cdn).rstrip("/")
+    if not cdn.startswith(("http://", "https://")):
+        cdn = "https://" + cdn
+    return cdn + "/" + path.lstrip("/")
+
+
+def _atlas(payload):
+    """返回 (images, music)。移植自 media-parser 的 _get_atlas_variants / get_image_list"""
+    photo = payload.get("photo") or {}
+    variants = [a for a in ((photo.get("ext_params") or {}).get("atlas"), payload.get("atlas"), photo.get("atlas"))
+                if isinstance(a, dict) and a.get("list")]
+    if not variants:
+        return [], None
+    atlas = next((a for a in variants if any(str(x).lower().endswith(".webp") for x in a["list"])), variants[0])
+    cdn = _cdns(atlas)[0]
+    images = [u for u in (_join(cdn, x) for x in atlas["list"]) if u]
+    music = None
+    src = next((a for a in variants if a.get("music")), None)
+    if src:
+        mc = [i.get("cdn") for i in src.get("musicCdnList") or [] if isinstance(i, dict) and i.get("cdn")]
+        music = _join(mc[0] if mc else cdn, src["music"])
+    return images, music
 
 
 def parse(url):
@@ -106,7 +159,8 @@ def parse(url):
     hit = _cache.get(pid)
     if hit and hit[0] > time.time():
         return hit[1]
-    p = _state(pid)
+    payload = _state(pid)
+    p = payload["photo"]
     ext = p.get("ext_params") or {}
     cover = next((c.get("url") for c in p.get("coverUrls") or [] if c.get("url")), None)
     res = {
@@ -122,12 +176,13 @@ def parse(url):
         "source_url": url,
         "videos": [u["url"] for u in p.get("mainMvUrls") or [] if u.get("url")],
         "images": [],
+        "music": None,
+        "photo_type": p.get("photoType"),
     }
-    atlas = ext.get("atlas") or p.get("atlas") or {}
-    if atlas.get("list"):
-        cdns = atlas.get("cdn") or atlas.get("cdnList") or []
-        cdn = cdns[0] if cdns and isinstance(cdns[0], str) else (cdns[0].get("cdn") if cdns else "p1.a.yximgs.com")
-        res["images"] = [("https://" + cdn + path) if path.startswith("/") else path for path in atlas["list"]]
+    images, music = _atlas(payload)
+    if images:
+        res["images"] = images
+        res["music"] = music
         res["media_type"] = "image"
     elif res["videos"]:
         res["media_type"] = "video"

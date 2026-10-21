@@ -1,8 +1,10 @@
-# 抖音提取 API（v6）
+# shortvid-api — 抖音 / 快手提取 API（v8）
 
 **输入抖音链接 → 无水印视频流 / 图文全部图片。**
 
 > **v6（2026-10-17）**：OmniParser 上游返回无关视频并封 IP，已默认关闭（`OMNI_ENABLED=0`），全部走 dyxhsdownloader；新增图文 `images[]` 支持；无标题/作者元数据、无画质选择。下方 v5 及以前的内容为历史记录，以 `API文档.md` 为准。
+
+> 🔑 **v8（2026-10-21）**：新增快手图集解析；除 `/health` 外所有接口需 API Key（`X-API-Key` 头 / `Authorization: Bearer` / `?key=`）。key 放在服务器 `/root/douyin-api/.env`（`API_KEY=...`，chmod 600，**不入库**）；返回的 `download_url` 自带签名，可直接打开。详见 `API文档.md` 文首与 `auth.py`。
 
 > 📖 **使用文档见 [`API文档.md`](API文档.md)** —— 面向调用方，含全部端点和实测示例。
 
@@ -134,3 +136,10 @@ OmniParser 的免费解析**按 IP 每日 30 次**。用尽后返回：
 ## 根本局限
 
 解析能力依赖第三方站点，对方无 SLA、协议可能变更。要完全自主需给 v1 直连引擎配住宅代理出口——**卡点是 IP，不是代码**。
+
+## 致谢 / 第三方代码
+
+快手图集（atlas）解析思路与 API-Key 鉴权模式参考并移植自
+[ucmao/media-parser](https://github.com/ucmao/media-parser)（MIT License，Copyright (c) ucmao）。
+相关代码见 `kuaishou.py`（`_atlas` / `_cdns` / `_join`）与 `auth.py`。
+

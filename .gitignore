@@ -4,3 +4,9 @@ server.log
 state.json
 *.bak*
 *.orig
+# secrets / local config — never commit
+.env
+.env.*
+*.key
+*.pem
+id_*

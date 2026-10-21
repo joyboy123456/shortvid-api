@@ -1,4 +1,4 @@
-# 抖音提取 API — 使用文档（v6，2026-10-17）
+# 抖音 / 快手提取 API（shortvid-api）— 使用文档（v8，2026-10-21）
 
 **给一个抖音链接（视频或图文），拿回无水印文件。**
 
@@ -11,6 +11,24 @@
 - 输入：抖音分享短链、PC 长链，或**整段分享文案**（自动挑出链接）
 - 支持：**视频** 和 **图文（图集）**
 - 当前引擎：`dyxhsdownloader`（`/health` 显示 `"engine": "dyxhs"`）
+- 快手：视频 + **图集**（v7/v8，见文末）
+
+> ### 🔑 v8 变更（2026-10-21）：需要 API Key
+> 除 `/health` 外，所有接口都要带 key，三种方式任选其一：
+>
+> ```bash
+> curl -H "X-API-Key: $KEY"              "https://your-domain.example/api/parse?url=…"
+> curl -H "Authorization: Bearer $KEY"   "https://your-domain.example/api/parse?url=…"
+> curl "https://your-domain.example/api/parse?url=…&key=$KEY"     # 或 POST body 里的 key 字段
+> ```
+>
+> - 没带 key → `401 {"ok":false,"error_code":"API_KEY_REQUIRED"}`；key 错误 → `401 … "INVALID_API_KEY"`；超出 QPS（默认不限）→ `429 RATE_LIMITED`
+> - 返回 JSON 里的 `download_url`（以及 `/api/video` 302 跳转地址）**自带 `exp`+`sig` 签名，6 小时内可直接打开，不用再带 key**，返回内容里也不会出现 key 本身。
+> - key 由服务器管理员在 `/root/douyin-api/.env`（`API_KEY=...`，权限 600）配置，多个 key 用 `API_KEYS=k1,k2`。改完 `systemctl restart douyin-api` 生效；换 key 后旧的签名链接随之失效。
+> - 浏览器跨域调用支持 CORS 预检（`OPTIONS`，允许 `X-API-Key` / `Authorization` 头）。
+> - 鉴权写法参考 [ucmao/media-parser](https://github.com/ucmao/media-parser)（MIT）的 `authenticate_api_key`，见 `auth.py`。
+>
+> 下文示例为简洁省略了 key，实际调用请加上 `-H "X-API-Key: $KEY"`（`download_url` 除外）。
 
 > ### v6 变更（2026-10-17）
 > 1. **OmniParser 默认关闭**：上游开始对同一链接返回随机无关视频（"投毒"），随后 WAF 以 `blocked_no_ticket` 拉黑本机 IP。现全部走 dyxhsdownloader，结果正确。需要时设 `OMNI_ENABLED=1` 恢复。
@@ -193,7 +211,9 @@ grab("https://v.douyin.com/kCcouifI_dQ/")
 
 | HTTP | 返回 | 原因与处理 |
 |---|---|---|
-| `400` | `未能从输入中提取抖音链接…` | 输入里没有抖音链接 |
+| `401` | `API_KEY_REQUIRED` / `INVALID_API_KEY` | 没带 key / key 错误；签名链接过期或被改动也返回 401 |
+| `429` | `RATE_LIMITED` | 超过 `QPS_LIMIT`（默认不限） |
+| `400` | `未能从输入中提取抖音或快手链接…` | 输入里没有抖音/快手链接 |
 | `400` | `缺少 url 参数` / `缺少 u 参数` | 忘传参数 |
 | `502` | `所有解析引擎均失败…` | 视频链接失效/被删/私密，或上游临时故障；稍后重试 |
 | `502` | `图集解析失败` | 图文链接失效，或上游取图失败 |
@@ -214,8 +234,8 @@ grab("https://v.douyin.com/kCcouifI_dQ/")
      --data-urlencode "url=https://v.douyin.com/1KyuRCvMRN0/" \
      --data-urlencode "name=我的视频.mp4" -o 我的视频.mp4
    ```
-6. **仅支持抖音**。其他平台返回 400。
-7. **服务无鉴权**，知道地址即可调用。
+6. **支持抖音和快手**。其他平台返回 400。
+7. **需要 API Key**（v8 起），见文首。`download_url` 为签名链接，6 小时有效（`SIGN_TTL`）。
 8. **本服务是适配/转发层**：链接 → 真实文件地址依赖第三方 dyxhsdownloader，对方协议变化时可能短时失效。
 
 ---
@@ -230,6 +250,11 @@ grab("https://v.douyin.com/kCcouifI_dQ/")
 | `DIRECT_TTL` | `1500` | 直链缓存（秒，仅 Omni） |
 | `OMNI_MIN_INTERVAL` | `2.5` | Omni 请求间隔（秒） |
 | `STATE_FILE` | `/root/douyin-api/state.json` | Omni 配额熔断状态 |
+| `API_KEY` / `API_KEYS` | （.env 中配置） | 访问 key；都为空时鉴权关闭（启动日志会提示） |
+| `QPS_LIMIT` | `0` | 每个 key 每秒请求上限，0 = 不限 |
+| `SIGN_TTL` | `21600` | download_url 签名有效期（秒） |
+| `SIGN_SECRET` | 由第一个 key 派生 | 下载链接签名密钥 |
+| `API_ENV_FILE` | `/root/douyin-api/.env` | 读取上述配置的文件（环境变量优先） |
 
 设置方式：在 `/etc/systemd/system/douyin-api.service` 的 `[Service]` 下加 `Environment=OMNI_ENABLED=1`，然后 `systemctl daemon-reload && systemctl restart douyin-api`。
 
@@ -271,7 +296,52 @@ journalctl -u cloudflared-douyin -n 30 --no-pager
 - `/api/video` 视频 302 到代理流；图集返回 JSON，`images[]` 每张一个 `download_url`
 - 实现：`kuaishou.py`（短链跳转取 photoId → `v.m.chenzhongtech.com/fw/photo/<id>` 页面 `window.INIT_STATE` → `photo.mainMvUrls`），失败回退 `m.gifshow.com`
 - 文件名：`ks_<photoId>_<标题前40字>.mp4`
+- v8 起也支持 `c.kuaishou.com/fw/photo/<id>`、`m.kuaishou.com/...` 等子域名链接
 
 ```bash
 curl -L "https://your-domain.example/api/video?url=https://www.kuaishou.com/f/X2tFbHVu5nnd5nd" -o 快手.mp4
 ```
+
+---
+
+## v8（2026-10-21）：快手图集 + API Key
+
+**快手图集（photoType = `VERTICAL_ATLAS` / `HORIZONTAL_ATLAS`）**，`/api/parse` 返回：
+
+```json
+{
+  "ok": true, "platform": "kuaishou", "engine": "kuaishou-share",
+  "photo_id": "3x86rz8fnvdtcwa", "photo_type": "VERTICAL_ATLAS", "media_type": "image",
+  "title": "是你的喜欢让我的喜欢变得有意义 #可爱壁纸 …", "author": "…", "cover": "https://…",
+  "image_count": 31,
+  "images": [
+    {"index": 0, "filename": "ks_3x86rz8fnvdtcwa_…_1.webp",
+     "direct_url": "https://p2.a.yximgs.com/ufile/atlas/…_0.webp",
+     "download_url": "https://your-domain.example/api/download?u=…&name=…&exp=…&sig=…"}
+  ],
+  "music": {"filename": "ks_…_music.m4a", "direct_url": "https://…m4a", "download_url": "…"},
+  "download_url": "（第一张图）", "direct_url": null
+}
+```
+
+- 图片优先取 `.webp` 原图（与 App 一致），`direct_url` 可裸连；`music` 为图集配乐（有则返回）
+- `/api/video` 对图集返回同样的 JSON（无单个视频可 302）
+- 实现移植自 [ucmao/media-parser](https://github.com/ucmao/media-parser)（MIT）的快手 atlas 解析：atlas 同时从 `photo.ext_params.atlas` 和与 `photo` 同级的 `atlas` 收集，CDN 取 `cdn`（字符串/列表）或 `cdnList[].cdn`
+
+批量下载图集：
+
+```bash
+B=https://your-domain.example
+curl -s -H "X-API-Key: $KEY" "$B/api/parse?url=https://v.kuaishou.com/fXITKr" \
+  | jq -r '.images[] | "\(.download_url) \(.filename)"' \
+  | while read u f; do curl -sL "$u" -o "$f"; done
+```
+
+### v8 实测（2026-10-21，本机 + 域名）
+
+- 快手图集 `v.kuaishou.com/fXITKr`：31 张 webp + 配乐，首张/末张 download_url → 206 image/webp，配乐 → 206 audio/mp4
+- 快手图集 `c.kuaishou.com/fw/photo/3xwiiyhbcpcy8dc`：6 张 + 配乐；整段分享文案 POST JSON 同样解析成功
+- 快手视频 `c.kuaishou.com/fw/photo/3xnh6zqupyhfm5e`：`media_type: video`，download_url → 206 video/mp4
+- 抖音视频 `www.douyin.com/video/7442274736408726819`、短链 `v.douyin.com/PSurH4fLass/`：带 key 200，download_url 200 video/mp4，`/api/video` 302 到签名地址
+- 鉴权：无 key 401 `API_KEY_REQUIRED`，错 key 401 `INVALID_API_KEY`，篡改 sig 401，`/health` 免 key 200，`OPTIONS` 204
+
